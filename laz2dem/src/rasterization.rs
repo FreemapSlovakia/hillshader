@@ -1,11 +1,14 @@
 use crate::{
-    lanczos::resize_lanczos3,
     options::Options,
     progress::Progress,
-    schema::create_schema,
     shared_types::{Job, PointWithHeight, Source},
 };
 use core::f64;
+use dem_common::{
+    overview::compose_overview_tile,
+    schema::create_schema,
+    tilecodec::{EDGE_BUFFER_PX, decode_dem_tile, encode_dem_tile},
+};
 use itertools::{Either, Itertools};
 use las::{Reader, point::Classification};
 use lru::LruCache;
@@ -24,9 +27,7 @@ use std::{
     thread::{self, available_parallelism},
     time::Duration,
 };
-use tilemath::{WEB_MERCATOR_EXTENT, tile::Tile};
-
-const BUFFER_PX: usize = 2;
+use tilemath::tile::Tile;
 
 const SELECT_TILE_EXISTS_SQL: &str =
     "SELECT 1 FROM tiles WHERE zoom_level = ?1 AND tile_column = ?2 AND tile_row = ?3";
@@ -34,12 +35,6 @@ const SELECT_TILE_EXISTS_SQL: &str =
 const INSERT_TILE_SQL: &str = "INSERT INTO tiles VALUES (?1, ?2, ?3, ?4)";
 
 const SELECT_LAZTILE_SQL: &str = "SELECT data FROM tiles WHERE x = ?1 AND y = ?2";
-
-struct Resize {
-    src: usize,
-    dest: usize,
-    size: usize,
-}
 
 pub fn rasterize(options: &Options, r#continue: bool, jobs: Vec<Job>) {
     let output = &options.output;
@@ -194,28 +189,7 @@ struct Context<'a> {
 }
 
 fn save_tile<'a>(ctx: &Context<'a>, tile: Tile, dem: Array2<f64>) {
-    let r = lerc::encode(
-        dem.mapv(|x| x as f32).as_slice().unwrap(),
-        None,
-        dem.ncols(),
-        dem.nrows(),
-        1,
-        1,
-        0,
-        2_f64.powf((20.0 - tile.zoom as f64) / 1.5) / 150.0,
-    )
-    .expect("error encoding lerc");
-
-    // let r: Vec<_> = dem
-    //     .as_slice()
-    //     .unwrap()
-    //     .iter()
-    //     .map(|v| *v as f32)
-    //     .into_iter()
-    //     .flat_map(|v| v.to_le_bytes().into_iter())
-    //     .collect();
-
-    let buffer = zstd::encode_all(Cursor::new(r), 0).unwrap();
+    let buffer = encode_dem_tile(&dem, tile.zoom);
 
     ctx.for_overviews.lock().unwrap().put(tile, dem);
 
@@ -234,9 +208,6 @@ fn process_single<'a>(ctx: &Context<'a>) -> bool {
     let options = ctx.options;
 
     // println!("Processing {:?}", job);
-
-    let pixel_size =
-        (2.0 * WEB_MERCATOR_EXTENT) / f64::from((options.tile_size as u32) << options.zoom_level);
 
     if ctx.r#continue {
         let (tile, tiles) = match job {
@@ -441,8 +412,8 @@ fn process_single<'a>(ctx: &Context<'a>) -> bool {
 
                 let slice = elevations
                     .slice(s![
-                        (y - BUFFER_PX)..(y + tile_size + BUFFER_PX),
-                        (x - BUFFER_PX)..(x + tile_size + BUFFER_PX)
+                        (y - EDGE_BUFFER_PX)..(y + tile_size + EDGE_BUFFER_PX),
+                        (x - EDGE_BUFFER_PX)..(x + tile_size + EDGE_BUFFER_PX)
                     ])
                     .to_owned();
 
@@ -523,32 +494,7 @@ fn process_single<'a>(ctx: &Context<'a>) -> bool {
                         .iter()
                         .find(|(_, tile)| tile == &row.0)
                         .map(|(sector, _)| {
-                            let buf = zstd::decode_all(Cursor::new(row.1)).unwrap();
-
-                            // let floats: Vec<_> = buf
-                            //     .chunks_exact(4)
-                            //     .into_iter()
-                            //     .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
-                            //     .collect();
-
-                            let floats = lerc::decode_auto::<f32>(&buf)
-                                .expect("error decoding lerc")
-                                .0;
-
-                            let len = floats.len();
-
-                            let dim = (len as f64).sqrt() as usize;
-
-                            assert_eq!(dim * dim, len, "data does not form a square matrix");
-
-                            (
-                                *sector,
-                                Array2::from_shape_vec(
-                                    (dim, dim),
-                                    floats.iter().map(|f| f64::from(*f)).collect(),
-                                )
-                                .unwrap(),
-                            )
+                            (*sector, decode_dem_tile(&row.1))
                         })
                 })
                 .chain(children_with_data)
@@ -557,46 +503,16 @@ fn process_single<'a>(ctx: &Context<'a>) -> bool {
 
             let tile_size = options.tile_size as usize;
 
-            let mut dem = Array2::<f64>::zeros([
-                (tile_size + BUFFER_PX * 2) * 2,
-                (tile_size + BUFFER_PX * 2) * 2,
-            ]);
-
-            for (sector, child_dem) in children {
-                let adjust = |c: usize| match c {
-                    0 => Resize {
-                        dest: 0,
-                        src: BUFFER_PX + tile_size - 2 * BUFFER_PX,
-                        size: 2 * BUFFER_PX,
-                    },
-                    1 => Resize {
-                        dest: 2 * BUFFER_PX,
-                        src: BUFFER_PX,
-                        size: tile_size,
-                    },
-                    2 => Resize {
-                        dest: 2 * BUFFER_PX + tile_size,
-                        src: BUFFER_PX,
-                        size: tile_size,
-                    },
-                    3 => Resize {
-                        dest: 2 * BUFFER_PX + 2 * tile_size,
-                        src: BUFFER_PX,
-                        size: 2 * BUFFER_PX,
-                    },
-                    _ => panic!("out of range"),
-                };
-
-                let y = adjust(sector & 3);
-                let x = adjust(sector >> 2);
-
-                dem.slice_mut(s![y.dest..(y.dest + y.size), x.dest..(x.dest + x.size)])
-                    .assign(&child_dem.slice(s![y.src..y.src + y.size, x.src..x.src + x.size]));
+            if let Some(dem) = compose_overview_tile(
+                children,
+                tile_size,
+                0.0,
+                options.overview_resampling.into(),
+            ) {
+                save_tile(ctx, tile, dem);
+            } else {
+                progress.lock().unwrap().done(tile);
             }
-
-            let dem = resize_lanczos3(&dem, (tile_size + BUFFER_PX * 2, tile_size + BUFFER_PX * 2));
-
-            save_tile(ctx, tile, dem);
         }
     };
 

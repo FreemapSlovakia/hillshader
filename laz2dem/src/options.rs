@@ -1,4 +1,5 @@
 use crate::shared_types::Source;
+use dem_common::overview::OverviewResampling as CommonOverviewResampling;
 use clap::{ArgGroup, Parser, ValueEnum};
 use std::{
     fmt::{Display, Formatter},
@@ -54,6 +55,10 @@ pub struct Options {
     /// LRU cache size
     #[clap(long, default_value_t = 4096)]
     pub lru_size: usize,
+
+    /// Resampling method for overview DEM tiles
+    #[clap(long, value_enum, default_value_t = OverviewResampling::Lanczos)]
+    pub overview_resampling: OverviewResampling,
 }
 
 impl Options {
@@ -70,6 +75,21 @@ impl Options {
             },
             Source::LazIndexDb,
         )
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
+pub enum OverviewResampling {
+    Lanczos,
+    Bilinear,
+}
+
+impl From<OverviewResampling> for CommonOverviewResampling {
+    fn from(value: OverviewResampling) -> Self {
+        match value {
+            OverviewResampling::Lanczos => Self::Lanczos,
+            OverviewResampling::Bilinear => Self::Bilinear,
+        }
     }
 }
 

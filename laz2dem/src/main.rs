@@ -1,9 +1,7 @@
-mod lanczos;
 mod options;
 mod points_reader;
 mod progress;
 mod rasterization;
-mod schema;
 mod shared_types;
 
 use std::fs::{exists, remove_file};

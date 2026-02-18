@@ -1,0 +1,10 @@
+[package]
+name = "dem-common"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ndarray = "0.16.1"
+lerc = "0.2.0"
+zstd = "0.13.3"
+rusqlite = "0.34.0"
