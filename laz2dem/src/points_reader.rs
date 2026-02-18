@@ -11,14 +11,14 @@ use spade::Point2;
 use std::sync::Mutex;
 use tilemath::{bbox::BBox, utils::bbox_covered_tiles};
 
-pub fn read(options: &Options) -> Vec<TileMeta> {
+pub fn read(options: &Options, bbox: &BBox, unit_zoom_level: u8) -> Vec<TileMeta> {
     let buffer_m = options.buffer as f64 / options.pixels_per_meter();
 
-    let tile_metas: Vec<_> = bbox_covered_tiles(&options.bbox, options.unit_zoom_level)
+    let tile_metas: Vec<_> = bbox_covered_tiles(bbox, unit_zoom_level)
         .map(|tile| TileMeta {
             tile,
             bbox: tile
-                .bounds(options.tile_size << (options.zoom_level - options.unit_zoom_level))
+                .bounds(options.tile_size << (options.zoom_level - unit_zoom_level))
                 .to_buffered(buffer_m),
             points: Mutex::new(Vec::<PointWithHeight>::new()),
         })
@@ -31,13 +31,7 @@ pub fn read(options: &Options) -> Vec<TileMeta> {
     let bbox_unprojected = options.source_projection.as_ref().map(|source_projection| {
         let bbox_unprojected: BBox = Proj::new_known_crs("EPSG:3857", source_projection, None)
             .expect("Failed to create PROJ transformation")
-            .transform_bounds(
-                options.bbox.min_x,
-                options.bbox.min_y,
-                options.bbox.max_x,
-                options.bbox.max_y,
-                11,
-            )
+            .transform_bounds(bbox.min_x, bbox.min_y, bbox.max_x, bbox.max_y, 11)
             .unwrap()
             .into();
 
@@ -50,14 +44,10 @@ pub fn read(options: &Options) -> Vec<TileMeta> {
 
     let rows = stmt
         .query_map(
-            <[f64; 4]>::from(bbox_unprojected.unwrap_or_else(|| {
-                BBox::new(
-                    options.bbox.min_x,
-                    options.bbox.min_y,
-                    options.bbox.max_x,
-                    options.bbox.max_y,
-                )
-            })),
+            <[f64; 4]>::from(
+                bbox_unprojected
+                    .unwrap_or_else(|| BBox::new(bbox.min_x, bbox.min_y, bbox.max_x, bbox.max_y)),
+            ),
             |row| row.get::<_, String>(0),
         )
         .unwrap();
@@ -96,7 +86,7 @@ pub fn read(options: &Options) -> Vec<TileMeta> {
                     |proj| proj.convert((point.x, point.y)).unwrap(),
                 );
 
-                if !options.bbox.contains(x, y) {
+                if !bbox.contains(x, y) {
                     continue;
                 }
 

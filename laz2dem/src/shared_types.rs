@@ -49,4 +49,5 @@ impl Job {
 pub enum Source {
     LazTileDb(PathBuf),
     LazIndexDb(PathBuf),
+    GeoTiff(PathBuf),
 }

@@ -1,4 +1,5 @@
 use crate::{
+    geotiff::GeoTiffContext,
     lanczos::resize_lanczos3,
     options::Options,
     progress::Progress,
@@ -24,7 +25,7 @@ use std::{
     thread::{self, available_parallelism},
     time::Duration,
 };
-use tilemath::{WEB_MERCATOR_EXTENT, tile::Tile};
+use tilemath::tile::Tile;
 
 const BUFFER_PX: usize = 2;
 
@@ -41,17 +42,20 @@ struct Resize {
     size: usize,
 }
 
-pub fn rasterize(options: &Options, r#continue: bool, jobs: Vec<Job>) {
+pub fn rasterize(
+    options: &Options,
+    bbox: &tilemath::bbox::BBox,
+    unit_zoom_level: u8,
+    r#continue: bool,
+    jobs: Vec<Job>,
+) {
     let output = &options.output;
 
     {
         let proj_3857_to_4326 = Proj::new_known_crs("EPSG:3857", "EPSG:4326", None)
             .expect("Failed to create PROJ transformation");
 
-        let mut bounds = vec![
-            (options.bbox.min_x, options.bbox.min_y),
-            (options.bbox.max_x, options.bbox.max_y),
-        ];
+        let mut bounds = vec![(bbox.min_x, bbox.min_y), (bbox.max_x, bbox.max_y)];
 
         proj_3857_to_4326.project_array(&mut bounds, false).unwrap();
 
@@ -87,7 +91,7 @@ pub fn rasterize(options: &Options, r#continue: bool, jobs: Vec<Job>) {
 
     let progress = Arc::new(Mutex::new(Progress::new(
         jobs,
-        options.zoom_level - options.unit_zoom_level,
+        options.zoom_level - unit_zoom_level,
         1,
     )));
 
@@ -95,10 +99,10 @@ pub fn rasterize(options: &Options, r#continue: bool, jobs: Vec<Job>) {
         Source::LazTileDb(path_buf) => Some(Arc::new(Mutex::new(
             Connection::open_with_flags(path_buf, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap(),
         ))),
-        Source::LazIndexDb(_) => None,
+        Source::LazIndexDb(_) | Source::GeoTiff(_) => None,
     };
 
-    let supertile_zoom_offset = options.zoom_level - options.unit_zoom_level;
+    let supertile_zoom_offset = options.zoom_level - unit_zoom_level;
 
     thread::scope(|scope| {
         let jobs_len = progress.lock().unwrap().jobs.len();
@@ -147,6 +151,10 @@ pub fn rasterize(options: &Options, r#continue: bool, jobs: Vec<Job>) {
             let for_overviews = Arc::clone(&for_overviews);
 
             let laztile_conn = laztile_conn.clone();
+            let geotiff_ctx = match options.source() {
+                Source::GeoTiff(path) => Some(GeoTiffContext::open(&path)),
+                _ => None,
+            };
 
             let tx = tx.clone();
 
@@ -159,6 +167,7 @@ pub fn rasterize(options: &Options, r#continue: bool, jobs: Vec<Job>) {
                     for_overviews,
                     tx,
                     laztile_conn,
+                    geotiff_ctx,
                     conn: Connection::open_with_flags(output, OpenFlags::SQLITE_OPEN_READ_ONLY)
                         .unwrap(),
                 };
@@ -190,6 +199,7 @@ struct Context<'a> {
     for_overviews: Arc<Mutex<LruCache<Tile, Array2<f64>>>>,
     tx: SyncSender<(Tile, Vec<u8>)>,
     laztile_conn: Option<Arc<Mutex<Connection>>>,
+    geotiff_ctx: Option<GeoTiffContext>,
     conn: Connection,
 }
 
@@ -202,7 +212,7 @@ fn save_tile<'a>(ctx: &Context<'a>, tile: Tile, dem: Array2<f64>) {
         1,
         1,
         0,
-        2_f64.powf((20.0 - tile.zoom as f64) / 1.5) / 150.0,
+        2_f64.powf((20.0 - tile.zoom as f64) / 1.5) / 100.0,
     )
     .expect("error encoding lerc");
 
@@ -235,9 +245,6 @@ fn process_single<'a>(ctx: &Context<'a>) -> bool {
 
     // println!("Processing {:?}", job);
 
-    let pixel_size =
-        (2.0 * WEB_MERCATOR_EXTENT) / f64::from((options.tile_size as u32) << options.zoom_level);
-
     if ctx.r#continue {
         let (tile, tiles) = match job {
             Job::Rasterize(ref tile_meta) => (
@@ -258,9 +265,9 @@ fn process_single<'a>(ctx: &Context<'a>) -> bool {
                     params_from_iter(tiles.iter().flat_map(|tile| {
                         [tile.zoom as u32, tile.x, tile.reversed_y()].into_iter()
                     })),
-                    |row| row.get::<_, usize>(0),
+                    |row| row.get::<_, isize>(0),
                 )
-                .unwrap();
+                .unwrap() as usize;
 
         if cnt == tiles.len() {
             for tile in tiles {
@@ -289,106 +296,7 @@ fn process_single<'a>(ctx: &Context<'a>) -> bool {
 
     match job {
         Job::Rasterize(tile_meta) => {
-            let points = ctx.laztile_conn.as_ref().map_or_else(
-                || tile_meta.points.into_inner().unwrap(),
-                |laztile_conn| {
-                    let chunks = {
-                        let laztile_conn = laztile_conn.lock().unwrap();
-
-                        let mut stmt = laztile_conn.prepare(SELECT_LAZTILE_SQL).unwrap();
-
-                        let mut rows = stmt.query((tile_meta.tile.x, tile_meta.tile.y)).unwrap();
-
-                        let mut chunks = Vec::new();
-
-                        while let Some(row) = rows.next().unwrap() {
-                            chunks.push(row.get::<_, Vec<u8>>(0).unwrap());
-                        }
-
-                        chunks
-                    };
-
-                    let mut points = Vec::new();
-
-                    for chunk in chunks {
-                        let mut reader = Reader::new(Cursor::new(chunk)).unwrap();
-
-                        reader.read_all_points_into(&mut points).unwrap();
-                    }
-
-                    points
-                        .into_iter()
-                        .filter_map(|point| {
-                            if point.classification == Classification::LowVegetation {
-                                None
-                            } else {
-                                Some(PointWithHeight {
-                                    position: Point2 {
-                                        x: point.x,
-                                        y: point.y,
-                                    },
-                                    height: point.z,
-                                })
-                            }
-                        })
-                        .collect()
-
-                    // with thinning; very slow probably because of `into_group_map_by`
-                    // TODO use Array2<(number, (x, y, z))>
-
-                    // points
-                    //     .into_iter()
-                    //     .filter_map(|point| {
-                    //         if point.classification == Classification::LowVegetation {
-                    //             None
-                    //         } else {
-                    //             Some(point)
-                    //         }
-                    //     })
-                    //     // thinning
-                    //     .into_group_map_by(|point| {
-                    //         ((point.x / pixel_size) as u32, (point.y / pixel_size) as u32)
-                    //     })
-                    //     .into_iter()
-                    //     .map(|(_, points)| {
-                    //         points
-                    //             .iter()
-                    //             .map(|p| (p.x, p.y, p.z))
-                    //             .reduce(|a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2))
-                    //             .map(|(x, y, z)| {
-                    //                 let len = points.len() as f64;
-
-                    //                 PointWithHeight {
-                    //                     position: Point2 {
-                    //                         x: x / len,
-                    //                         y: y / len,
-                    //                     },
-                    //                     height: z / len,
-                    //                 }
-                    //             })
-                    //             .unwrap()
-                    //     })
-                    //     .collect::<Vec<_>>()
-                },
-            );
-
-            if points.is_empty() {
-                for off in 0..=ctx.supertile_zoom_offset {
-                    let tiles = tile_meta.tile.descendants(off);
-
-                    for tile in tiles {
-                        progress.lock().unwrap().done(tile);
-                    }
-                }
-
-                return true;
-            }
-
             let mut triangulation = DelaunayTriangulation::<PointWithHeight>::new();
-
-            for point in points {
-                triangulation.insert(point).unwrap();
-            }
 
             let bbox = tile_meta.bbox;
 
@@ -398,32 +306,113 @@ fn process_single<'a>(ctx: &Context<'a>) -> bool {
 
             let height_pixels = (bbox.height() * pixels_per_meter).round() as usize;
 
-            let mut elevations = Array2::<f64>::zeros([height_pixels, width_pixels]);
+            let elevations = if let Some(geotiff_ctx) = ctx.geotiff_ctx.as_ref() {
+                geotiff_ctx.read_resampled(bbox, width_pixels, height_pixels)
+            } else {
+                let points = ctx.laztile_conn.as_ref().map_or_else(
+                    || tile_meta.points.into_inner().unwrap(),
+                    |laztile_conn| {
+                        let chunks = {
+                            let laztile_conn = laztile_conn.lock().unwrap();
 
-            let natural_neighbor = triangulation.natural_neighbor();
+                            let mut stmt = laztile_conn.prepare(SELECT_LAZTILE_SQL).unwrap();
 
-            for y in 0..height_pixels {
-                let cy = bbox.min_y + y as f64 * bbox.height() / height_pixels as f64;
+                            let mut rows =
+                                stmt.query((tile_meta.tile.x, tile_meta.tile.y)).unwrap();
 
-                for x in 0..width_pixels {
-                    let cx = bbox.min_x + x as f64 * bbox.width() / width_pixels as f64;
+                            let mut chunks = Vec::new();
 
-                    elevations[[height_pixels - y - 1, x]] = natural_neighbor
-                        .interpolate(
-                            |v| {
-                                // // skip triangle bigger than 50m
-                                // if v.out_edges().any(|e| e.length_2() > 2500.0) {
-                                //     f64::NAN
-                                // } else {
-                                //     v.data().height
-                                // }
+                            while let Some(row) = rows.next().unwrap() {
+                                chunks.push(row.get::<_, Vec<u8>>(0).unwrap());
+                            }
 
-                                v.data().height
-                            },
-                            Point2::new(cx, cy),
-                        )
-                        .unwrap_or(f64::NAN);
+                            chunks
+                        };
+
+                        let mut points = Vec::new();
+
+                        for chunk in chunks {
+                            let mut reader = Reader::new(Cursor::new(chunk)).unwrap();
+
+                            reader.read_all_points_into(&mut points).unwrap();
+                        }
+
+                        points
+                            .into_iter()
+                            .filter_map(|point| {
+                                if point.classification == Classification::LowVegetation {
+                                    None
+                                } else {
+                                    Some(PointWithHeight {
+                                        position: Point2 {
+                                            x: point.x,
+                                            y: point.y,
+                                        },
+                                        height: point.z,
+                                    })
+                                }
+                            })
+                            .collect()
+                    },
+                );
+
+                if points.is_empty() {
+                    for off in 0..=ctx.supertile_zoom_offset {
+                        let tiles = tile_meta.tile.descendants(off);
+
+                        for tile in tiles {
+                            progress.lock().unwrap().done(tile);
+                        }
+                    }
+
+                    return true;
                 }
+
+                for point in points {
+                    triangulation.insert(point).unwrap();
+                }
+
+                let mut elevations = Array2::<f64>::zeros([height_pixels, width_pixels]);
+
+                let natural_neighbor = triangulation.natural_neighbor();
+
+                for y in 0..height_pixels {
+                    let cy = bbox.min_y + y as f64 * bbox.height() / height_pixels as f64;
+
+                    for x in 0..width_pixels {
+                        let cx = bbox.min_x + x as f64 * bbox.width() / width_pixels as f64;
+
+                        elevations[[height_pixels - y - 1, x]] = natural_neighbor
+                            .interpolate(
+                                |v| {
+                                    // // skip triangle bigger than 50m
+                                    // if v.out_edges().any(|e| e.length_2() > 2500.0) {
+                                    //     f64::NAN
+                                    // } else {
+                                    //     v.data().height
+                                    // }
+
+                                    v.data().height
+                                },
+                                Point2::new(cx, cy),
+                            )
+                            .unwrap_or(f64::NAN);
+                    }
+                }
+
+                elevations
+            };
+
+            if elevations.iter().all(|v| v.is_nan()) {
+                for off in 0..=ctx.supertile_zoom_offset {
+                    let tiles = tile_meta.tile.descendants(off);
+
+                    for tile in tiles {
+                        progress.lock().unwrap().done(tile);
+                    }
+                }
+
+                return true;
             }
 
             let mut tiles = tile_meta.tile.descendants(ctx.supertile_zoom_offset);

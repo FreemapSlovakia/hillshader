@@ -22,12 +22,16 @@ pub struct Options {
     #[clap(long, group = "exclusive")]
     pub laz_index_db: Option<PathBuf>,
 
+    /// Source as GeoTIFF DEM in EPSG:3857
+    #[clap(long, group = "exclusive")]
+    pub geotiff: Option<PathBuf>,
+
     /// EPSG:3857 bounding box to render
     #[clap(long)]
-    pub bbox: BBox,
+    pub bbox: Option<BBox>,
 
     /// Projection of points if reading from *.laz; default is EPSG:3857
-    #[clap(long, conflicts_with = "laz_tile_db")]
+    #[clap(long, conflicts_with_all = ["laz_tile_db", "geotiff"])]
     pub source_projection: Option<String>,
 
     /// Max zoom level of tiles to generate
@@ -62,14 +66,15 @@ impl Options {
     }
 
     pub fn source(&self) -> Source {
-        self.laz_index_db.clone().map_or_else(
-            || {
-                self.laz_tile_db
-                    .clone()
-                    .map_or_else(|| unreachable!("only one"), Source::LazTileDb)
-            },
-            Source::LazIndexDb,
-        )
+        if let Some(path) = self.laz_index_db.clone() {
+            Source::LazIndexDb(path)
+        } else if let Some(path) = self.laz_tile_db.clone() {
+            Source::LazTileDb(path)
+        } else {
+            self.geotiff
+                .clone()
+                .map_or_else(|| unreachable!("only one"), Source::GeoTiff)
+        }
     }
 }
 
