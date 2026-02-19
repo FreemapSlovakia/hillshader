@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tokio = { version = "1.45.1", features = ["macros", "rt-multi-thread"] }
-axum = "0.8.4"
-rusqlite = "0.36.0"
-hyper = "1.6.0"
-clap = { version = "4.5.40", features = ["derive"] }
+tokio = { version = "1.49.0", features = ["macros", "rt-multi-thread"] }
+axum = "0.8.8"
+rusqlite = "0.38.0"
+hyper = "1.8.1"
+clap = { version = "4.5.59", features = ["derive"] }
